@@ -1,0 +1,6 @@
+torch>=2.1
+pytest>=7.0
+# Optional, for scanning HF models via CLI:
+transformers>=4.43
+
+
