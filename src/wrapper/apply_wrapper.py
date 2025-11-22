@@ -12,7 +12,7 @@ SRC_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if SRC_ROOT not in sys.path:
     sys.path.insert(0, SRC_ROOT)
 
-from wrapper import make_he_ready_model
+from wrapper import make_he_ready_model, enable_attention_approximation
 
 
 def load_model(model_name: str, device: torch.device) -> torch.nn.Module:
@@ -35,11 +35,14 @@ def main() -> None:
     parser.add_argument("--hf_model", type=str, required=True)
     parser.add_argument("--config", type=str, default="he_friendly_low", choices=["baseline", "he_friendly_low", "he_friendly_high"])
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
+    parser.add_argument("--approx_attention", action="store_true", help="Enable HE-style SDPA approximation")
     args = parser.parse_args()
 
     device = torch.device("cuda" if (args.device == "cuda" or (args.device == "auto" and torch.cuda.is_available())) else "cpu")
     model = load_model(args.hf_model, device=device)
     model = make_he_ready_model(model, config=args.config)
+    if args.approx_attention:
+        enable_attention_approximation()
     inputs = build_inputs(args.hf_model, device=device)
 
     model.eval()
