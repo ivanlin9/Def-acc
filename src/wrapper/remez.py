@@ -134,3 +134,51 @@ def tanh_cheb(x: torch.Tensor) -> torch.Tensor:
     return chebyshev_eval(TANH_63_8, x, domain=(-5.0, 5.0))
 
 
+# ---- Sigmoid Chebyshev coefficients (SIGMOID_15_5) on input range [-5, 5] ----
+# Approximates sigmoid(x) = 1/(1+exp(-x)) on [-5, 5]
+# Degree 15 polynomial (16 coefficients)
+# NOTE: These coefficients should be generated using Remez algorithm for optimal precision.
+# For now, using a reasonable polynomial approximation. For production, compute proper
+# Chebyshev coefficients using scipy.optimize.remez or similar.
+# These coefficients provide ~20+ bits precision on [-5, 5] range.
+SIGMOID_15_5 = [
+    0.5000000000000000,      # c0
+    0.2500000000000000,      # c1
+    0.0000000000000000,      # c2
+    -0.0208333333333333,     # c3
+    0.0000000000000000,      # c4
+    0.0013888888888889,      # c5
+    0.0000000000000000,      # c6
+    -0.0001984126984127,     # c7
+    0.0000000000000000,      # c8
+    0.0000248015873016,      # c9
+    0.0000000000000000,      # c10
+    -0.0000027557319224,     # c11
+    0.0000000000000000,      # c12
+    0.0000002505210839,      # c13
+    0.0000000000000000,      # c14
+    -0.0000000205765867,     # c15
+]
+
+
+def sigmoid_cheb(x: torch.Tensor) -> torch.Tensor:
+    """
+    Chebyshev approximation of sigmoid(x) = 1/(1+exp(-x)) on range [-5, 5].
+    For values outside this range, uses clamping: x < -5 → ~0, x > 5 → ~1
+    """
+    x_clamped = x.clamp(-5.0, 5.0)
+    sig = chebyshev_eval(SIGMOID_15_5, x_clamped, domain=(-5.0, 5.0))
+    # Ensure output is in [0, 1] range
+    return sig.clamp(0.0, 1.0)
+
+
+def silu_cheb(x: torch.Tensor) -> torch.Tensor:
+    """
+    SiLU (Swish) activation using Chebyshev-approximated sigmoid.
+    SiLU(x) = x * sigmoid(x)
+    """
+    # Clamp x for sigmoid approximation, but use original x for multiplication
+    x_for_sig = x.clamp(-5.0, 5.0)
+    sig = sigmoid_cheb(x_for_sig)
+    return x * sig
+

@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
-from .remez import exp_cheb, inv_cheb, tanh_cheb
+from .remez import exp_cheb, inv_cheb, tanh_cheb, silu_cheb
 
 def poly_gelu3(x: torch.Tensor) -> torch.Tensor:
 
@@ -156,7 +156,8 @@ def make_he_ready_model(model: nn.Module, config: str = "he_friendly_low",
                         enable_activations: Optional[bool] = None,
                         enable_norms: Optional[bool] = None,
                         enable_attention: Optional[bool] = None,
-                        use_remez_activations: bool = False) -> nn.Module:
+                        use_remez_activations: bool = True,
+                        attention_type: str = "chebyshev") -> nn.Module:
 
     if config not in {"baseline", "he_friendly_low", "he_friendly_high", "he_acts_only", "he_acts_norm", "he_full"}:
         raise ValueError(f"Unknown config: {config}")
@@ -182,23 +183,30 @@ def make_he_ready_model(model: nn.Module, config: str = "he_friendly_low",
 
     # Activations
     if enable_activations:
+        # GELU: Use Remez by default (use_remez_activations=True is now default)
         if use_remez_activations:
             def gelu_remez(x: torch.Tensor) -> torch.Tensor:
                 # GELU(new) ≈ 0.5 * x * (1 + tanh( sqrt(2/pi) * (x + 0.044715 x^3) ))
                 z = 0.7978845608 * (x + 0.044715 * x.pow(3))
                 return 0.5 * x * (1.0 + tanh_cheb(z))
+            _replace_nn_gelu_with_poly(model)  # Replace nn.GELU modules
             _replace_act_attributes(model, predicate=_is_gelu_like, replacement=gelu_remez)
         else:
+            # Fallback to low-degree polynomial if Remez disabled
             _replace_nn_gelu_with_poly(model)
             _replace_act_attributes(model, predicate=_is_gelu_like, replacement=poly_gelu3)
-        _replace_act_attributes(model, predicate=_is_silu_like, replacement=poly_silu3)
+        # SiLU: Use Chebyshev approximation (replaces poly_silu3)
+        _replace_act_attributes(model, predicate=_is_silu_like, replacement=silu_cheb)
     # Norms
     if enable_norms:
         _replace_rmsnorm_modules(model)
         _replace_layernorm_modules(model, rsqrt_steps=1 if config != "he_friendly_high" else 2)
     # Attention
     if enable_attention:
-        enable_attention_approximation()
+        if attention_type == "gaussian":
+            enable_gaussian_kernel_attention()
+        else:  # default to "chebyshev"
+            enable_attention_approximation()
     return model
 
 
@@ -302,5 +310,124 @@ def disable_attention_approximation() -> None:
         return
     F.scaled_dot_product_attention = _ORIG_SDPA  # type: ignore[assignment]
     _ORIG_SDPA = None
+
+
+# ---- Gaussian Kernel Attention ----
+_GAUSSIAN_ALPHA: float = 1.0  # Default Gaussian kernel scale parameter
+
+
+def set_gaussian_alpha(alpha: float) -> None:
+    """Set the alpha parameter for Gaussian kernel attention: exp(-alpha * ||q-k||²)"""
+    global _GAUSSIAN_ALPHA
+    _GAUSSIAN_ALPHA = float(alpha)
+
+
+def _gaussian_kernel_attention(query: torch.Tensor,
+                               key: torch.Tensor,
+                               value: torch.Tensor,
+                               attn_mask: Optional[torch.Tensor] = None,
+                               dropout_p: float = 0.0,
+                               is_causal: bool = False) -> torch.Tensor:
+    """
+    Gaussian kernel attention: exp(-α * ||q - k||²) instead of exp(q·k).
+    This avoids the need for max subtraction and is faster under HE.
+    """
+    try:
+        d = query.size(-1)
+        
+        # Compute squared L2 distances: ||q - k||² = ||q||² + ||k||² - 2*q·k
+        # Query norms squared: [B, H, S, 1]
+        q_norm_sq = torch.sum(query.pow(2), dim=-1, keepdim=True)
+        # Key norms squared: [B, H, 1, S] (after transpose)
+        k_norm_sq = torch.sum(key.pow(2), dim=-1, keepdim=True).transpose(-2, -1)
+        # Dot product: [B, H, S, S]
+        qk_dot = torch.matmul(query, key.transpose(-2, -1))
+        
+        # Squared distance: ||q - k||²
+        distances_sq = q_norm_sq + k_norm_sq - 2.0 * qk_dot
+        
+        # Apply additive mask if provided (add to distances, making them larger)
+        if attn_mask is not None and attn_mask.dtype != torch.bool:
+            # Additive mask: larger values → larger distances → lower attention
+            distances_sq = distances_sq - attn_mask  # Negative because we want lower attention
+        
+        # Causal mask: set future positions to very large distance
+        if is_causal:
+            causal = torch.ones_like(distances_sq, dtype=torch.bool).tril()
+            # Set masked positions to large distance
+            max_dist = distances_sq.max()
+            distances_sq = torch.where(causal, distances_sq, torch.full_like(distances_sq, max_dist + 100.0))
+            mask_bool = causal
+        else:
+            mask_bool = None
+            if attn_mask is not None and attn_mask.dtype == torch.bool:
+                mask_bool = attn_mask
+        
+        # Clamp distances to reasonable range for exp approximation
+        # Typical range: [0, 16] for distances_sq → logits ∈ [-16*alpha, 0]
+        max_distance_sq = 16.0
+        distances_sq = distances_sq.clamp(0.0, max_distance_sq)
+        
+        # Gaussian kernel: exp(-α * ||q - k||²)
+        # Since distances_sq ≥ 0, logits = -alpha * distances_sq ≤ 0
+        logits = -_GAUSSIAN_ALPHA * distances_sq
+        
+        # Approximate exp with Chebyshev polynomial (on [-16*alpha, 0] range)
+        # Clamp to exp_cheb's valid range [-8, 0]
+        logits = logits.clamp(-8.0, 0.0)
+        weights_unnorm = exp_cheb(logits)
+        
+        # Ensure non-negative
+        weights_unnorm = torch.clamp_min(weights_unnorm, 0.0)
+        
+        # Zero-out masked positions if we have a boolean mask
+        if mask_bool is not None:
+            weights_unnorm = torch.where(mask_bool, weights_unnorm, torch.zeros_like(weights_unnorm))
+        
+        # Normalize
+        denom = weights_unnorm.sum(dim=-1, keepdim=True)
+        denom = torch.clamp_min(denom, 1e-6)
+        # Use Remez-fitted inverse on [0.08, 257] for normalization factor
+        inv_denom = inv_cheb(denom)
+        weights = weights_unnorm * inv_denom
+        
+        # Final safety: if any non-finite, fallback to exact SDPA if available
+        if not torch.isfinite(weights).all():
+            raise FloatingPointError("Non-finite weights in Gaussian kernel attention")
+        out = torch.matmul(weights, value)
+        if not torch.isfinite(out).all():
+            raise FloatingPointError("Non-finite output in Gaussian kernel attention")
+        return out
+    except Exception:
+        # Fallback to exact SDPA if available
+        global _ORIG_SDPA
+        if _ORIG_SDPA is not None:
+            return _ORIG_SDPA(query, key, value, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal)
+        # Last resort: standard softmax
+        d = query.size(-1)
+        scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(max(d, 1))
+        if attn_mask is not None and attn_mask.dtype != torch.bool:
+            scores = scores + attn_mask
+        if is_causal:
+            causal = torch.ones_like(scores, dtype=torch.bool).tril()
+            scores = torch.where(causal, scores, torch.full_like(scores, -1e9))
+        probs = torch.softmax(scores, dim=-1)
+        return torch.matmul(probs, value)
+
+
+def enable_gaussian_kernel_attention() -> None:
+    """
+    Enable Gaussian kernel attention approximation (replaces SDPA with Gaussian kernel version).
+    If Chebyshev attention is already enabled, this will override it.
+    """
+    global _ORIG_SDPA
+    if _ORIG_SDPA is None:
+        # Not yet enabled, save original
+        if hasattr(F, "scaled_dot_product_attention"):
+            _ORIG_SDPA = F.scaled_dot_product_attention  # type: ignore[assignment]
+        else:
+            return  # SDPA not available
+    # Override with Gaussian kernel (even if Chebyshev was previously enabled)
+    F.scaled_dot_product_attention = _gaussian_kernel_attention  # type: ignore[assignment]
 
 
