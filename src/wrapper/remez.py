@@ -5,11 +5,7 @@ import torch
 
 
 def chebyshev_eval(coeffs: Iterable[float], x: torch.Tensor, domain: Tuple[float, float]) -> torch.Tensor:
-    """
-    Evaluate Chebyshev series sum_{k=0}^{n} c_k T_k(t) at x using Clenshaw's algorithm.
-    Coefficients are ordered [c0, c1, ..., cn].
-    Domain maps x in [a, b] to t in [-1, 1].
-    """
+
     a, b = domain
     # Map x from [a,b] to t in [-1,1]
     t = (2.0 * (x - a) / (b - a)) - 1.0
@@ -28,8 +24,7 @@ def chebyshev_eval(coeffs: Iterable[float], x: torch.Tensor, domain: Tuple[float
     return t * b_kplus1 - b_kplus2 + float(c[0])
 
 
-# ---- Ported Chebyshev coefficients from Encryption-friendly_LLM_Architecture (SoftmaxRemezCoeff.hpp) ----
-# EXPONENTIAL_UNI_15 on input range [-8, 0]
+
 EXP_UNI_15 = [
     0.20700192122398669790, 0.35750167900487065403, 0.23525300294553806878,
     0.12224867605933258525, 0.051879988856539190900, 0.018488698346254203451,
