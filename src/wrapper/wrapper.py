@@ -10,11 +10,7 @@ import math
 from .remez import exp_cheb, inv_cheb, tanh_cheb
 
 def poly_gelu3(x: torch.Tensor) -> torch.Tensor:
-    """
-    Low-degree polynomial surrogate for GELU, HE-friendly (no exp/erf/tanh).
-    Form: 0.5 * x * (1 + k1 * x + k3 * x^3)
-    Coefficients chosen to roughly approximate 'gelu_new' near zero.
-    """
+
     x = x.clamp(-ACT_CLIP, ACT_CLIP)
     k1 = 0.7978845608  # sqrt(2/pi)
     k3 = 0.0356774081  # heuristic cubic coefficient
@@ -38,10 +34,7 @@ def _replace_nn_gelu_with_poly(module: nn.Module) -> int:
 
 
 def _replace_act_attributes(model: nn.Module, predicate: Callable[[Callable[..., torch.Tensor]], bool], replacement: Callable[..., torch.Tensor]) -> int:
-    """
-    Replace submodule 'act' attributes when predicate(act_fn) is True.
-    Returns the number of replacements performed.
-    """
+
     replaced = 0
     for _, sub in model.named_modules():
         if hasattr(sub, "act"):
@@ -62,10 +55,7 @@ def _is_gelu_like(fn: Callable[..., torch.Tensor]) -> bool:
     return "gelu" in name.lower() or fn is F.gelu
 
 def poly_silu3(x: torch.Tensor) -> torch.Tensor:
-    """
-    Low-degree polynomial surrogate for SiLU = x * sigmoid(x).
-    Approximate sigmoid(x) ~ 0.5 + 0.15012 x - 0.001593 x^3 (rough heuristic).
-    """
+
     x = x.clamp(-ACT_CLIP, ACT_CLIP)
     s = 0.5 + 0.15012 * x - 0.001593 * x.pow(3)
     return x * s
@@ -75,11 +65,7 @@ def _is_silu_like(fn: Callable[..., torch.Tensor]) -> bool:
     return "silu" in name.lower() or fn is F.silu or fn is getattr(torch, "silu", object())
 
 class HEFriendlyRMSNorm(nn.Module):
-    """
-    Approximate RMSNorm: x * rsqrt(mean(x^2) + eps) * weight
-    Replace rsqrt with a small polynomial around 1: for z in ~[0.5, 1.5],
-    (z)^(-1/2) ≈ 1 - 0.5*(z-1) + 0.375*(z-1)^2
-    """
+
     def __init__(self, hidden_size: int, eps: float = 1e-6, weight: Optional[torch.Tensor] = None) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -101,10 +87,7 @@ class HEFriendlyRMSNorm(nn.Module):
         return y * self.weight
 
 def _replace_rmsnorm_modules(model: nn.Module) -> int:
-    """
-    Replace modules whose class name is 'RMSNorm' (case-insensitive) with HEFriendlyRMSNorm,
-    attempting to carry over 'weight' and 'eps' attributes if present.
-    """
+
     replaced = 0
     for name, child in list(model.named_children()):
         # Recurse
@@ -121,10 +104,7 @@ def _replace_rmsnorm_modules(model: nn.Module) -> int:
             replaced += 1
     return replaced
 class HEFriendlyLayerNorm(nn.Module):
-    """
-    Approximate LayerNorm: (x - mean) * rsqrt(var + eps) * weight + bias
-    rsqrt is approximated with a few Newton steps starting from y0=1.
-    """
+
     def __init__(self, normalized_shape: int, eps: float = 1e-5,
                  weight: Optional[torch.Tensor] = None, bias: Optional[torch.Tensor] = None,
                  rsqrt_steps: int = 1) -> None:
@@ -237,10 +217,7 @@ def set_calibration(act_clip: Optional[float] = None, logits_clip: Optional[floa
 
 
 def _pade_exp(x: torch.Tensor) -> torch.Tensor:
-    """
-    Pade [1/1] approximation of exp(x): exp(x) ≈ (1 + x/2) / (1 - x/2)
-    We clamp input to keep denominator positive and stable.
-    """
+
     x = torch.clamp(x, min=-2.0, max=2.0)
     num = 1.0 + 0.5 * x
     den = 1.0 - 0.5 * x
@@ -253,12 +230,7 @@ def _approx_scaled_dot_product_attention(query: torch.Tensor,
                                          attn_mask: Optional[torch.Tensor] = None,
                                          dropout_p: float = 0.0,
                                          is_causal: bool = False) -> torch.Tensor:
-    """
-    HE-friendly SDPA approximation:
-    - scores = (Q K^T) / sqrt(d)
-    - apply attn_mask (additive) and/or causal mask
-    - approximate softmax via Pade exp with one reciprocal normalization
-    """
+
     try:
         d = query.size(-1)
         scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(max(d, 1))
@@ -315,9 +287,7 @@ def _approx_scaled_dot_product_attention(query: torch.Tensor,
 
 
 def enable_attention_approximation() -> None:
-    """
-    Monkeypatch torch.nn.functional.scaled_dot_product_attention with HE-friendly approximation.
-    """
+
     global _ORIG_SDPA
     if _ORIG_SDPA is not None:
         return

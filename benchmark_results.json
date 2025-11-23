@@ -14,13 +14,5 @@
       "hellaswag": 0.513343955387373,
       "lambada_openai": 0.679992237531535
     }
-  },
-  {
-    "model": "GPT-2 (HE-ready norms rsqrt2)",
-    "timestamp": "2025-11-23T06:40:27.108152",
-    "metrics": {
-      "hellaswag": 0.2504481179047998,
-      "lambada_openai": 0.0
-    }
   }
 ]
